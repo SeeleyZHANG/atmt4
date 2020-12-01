@@ -21,14 +21,21 @@ def get_args():
 
     # Add data arguments
     parser.add_argument('--data', default='data_asg4/prepared_data', help='path to data directory')
-    parser.add_argument('--checkpoint-path', default='checkpoints_asg4/checkpoint_best.pt', help='path to the model file')
+    parser.add_argument('--checkpoint-path', default='checkpoints_asg4/checkpoint_best.pt',
+                        help='path to the model file')
     parser.add_argument('--batch-size', default=None, type=int, help='maximum number of sentences in a batch')
-    parser.add_argument('--output', default='model_translations.txt', type=str,
+    parser.add_argument('--output', default='model_translations_nbest_k3_alpha09_gamma10neg.txt', type=str,
                         help='path to the output file destination')
     parser.add_argument('--max-len', default=100, type=int, help='maximum length of generated sequence')
 
     # Add beam search arguments
-    parser.add_argument('--beam-size', default=5, type=int, help='number of hypotheses expanded in beam search')
+    parser.add_argument('--beam-size', default=3, type=int, help='number of hypotheses expanded in beam search')
+
+    # Add normalization parameter alpha
+    parser.add_argument('--alpha', default=0.0, type=float, help='length normalization of the sentence length')
+
+    # Add gamma parameter for diversity beam search
+    parser.add_argument('--gamma', default=0.0, type=float, help='ratio of diverse metric')
 
     return parser.parse_args()
 
@@ -36,7 +43,7 @@ def get_args():
 def main(args):
     """ Main translation function' """
     # Load arguments from checkpoint
-    torch.manual_seed(args.seed)
+    torch.manual_seed(args.seed)  
     state_dict = torch.load(args.checkpoint_path, map_location=lambda s, l: default_restore_location(s, 'cpu'))
     args_loaded = argparse.Namespace(**{**vars(args), **vars(state_dict['args'])})
     args_loaded.data = args.data
@@ -73,10 +80,10 @@ def main(args):
     for i, sample in enumerate(progress_bar):
 
         # Create a beam search object or every input sentence in batch
-        batch_size = sample['src_tokens'].shape[0]
+        batch_size = sample['src_tokens'].shape[0]  # returns number of rows from sample['src_tokens']
         searches = [BeamSearch(args.beam_size, args.max_len - 1, tgt_dict.unk_idx) for i in range(batch_size)]
 
-        with torch.no_grad():
+        with torch.no_grad():  
             # Compute the encoder output
             encoder_out = model.encoder(sample['src_tokens'], sample['src_lengths'])
             # __QUESTION 1: What is "go_slice" used for and what do its dimensions represent?
@@ -86,45 +93,50 @@ def main(args):
                 go_slice = utils.move_to_cuda(go_slice)
 
             # Compute the decoder output at the first time step
-            decoder_out, _ = model.decoder(go_slice, encoder_out)
+            decoder_out, _ = model.decoder(go_slice, encoder_out)  # decoder out = decoder(tgt_inputs, encoder_out)
 
             # __QUESTION 2: Why do we keep one top candidate more than the beam size?
             log_probs, next_candidates = torch.topk(torch.log(torch.softmax(decoder_out, dim=2)),
-                                                    args.beam_size+1, dim=-1)
-
-        # Create number of beam_size beam search nodes for every input sentence
+                                                    args.beam_size + 1, dim=-1)
+        
+        #  Create number of beam_size beam search nodes for every input sentence
         for i in range(batch_size):
             for j in range(args.beam_size):
                 best_candidate = next_candidates[i, :, j]
-                backoff_candidate = next_candidates[i, :, j+1]
+                backoff_candidate = next_candidates[i, :, j + 1]
                 best_log_p = log_probs[i, :, j]
-                backoff_log_p = log_probs[i, :, j+1]
+                backoff_log_p = log_probs[i, :, j + 1]
                 next_word = torch.where(best_candidate == tgt_dict.unk_idx, backoff_candidate, best_candidate)
                 log_p = torch.where(best_candidate == tgt_dict.unk_idx, backoff_log_p, best_log_p)
                 log_p = log_p[-1]
 
                 # Store the encoder_out information for the current input sentence and beam
-                emb = encoder_out['src_embeddings'][:,i,:]
-                lstm_out = encoder_out['src_out'][0][:,i,:]
-                final_hidden = encoder_out['src_out'][1][:,i,:]
-                final_cell = encoder_out['src_out'][2][:,i,:]
+                emb = encoder_out['src_embeddings'][:, i, :]
+                lstm_out = encoder_out['src_out'][0][:, i, :]
+                final_hidden = encoder_out['src_out'][1][:, i, :]
+                final_cell = encoder_out['src_out'][2][:, i, :]
                 try:
-                    mask = encoder_out['src_mask'][i,:]
+                    mask = encoder_out['src_mask'][i, :]
                 except TypeError:
                     mask = None
 
                 node = BeamSearchNode(searches[i], emb, lstm_out, final_hidden, final_cell,
                                       mask, torch.cat((go_slice[i], next_word)), log_p, 1)
+
+                # add normalization here according to paper
+                score = node.logp / Length_normalization(node.length)
+                # Add diverse
+                score = diversity(score, j)
                 # __QUESTION 3: Why do we add the node with a negative score?
-                searches[i].add(-node.eval(), node)
+                searches[i].add(-score, node)
 
         # Start generating further tokens until max sentence length reached
-        for _ in range(args.max_len-1):
+        for _ in range(args.max_len - 1):
 
             # Get the current nodes to expand
             nodes = [n[1] for s in searches for n in s.get_current_beams()]
             if nodes == []:
-                break # All beams ended in EOS
+                break  # All beams ended in EOS
 
             # Reconstruct prev_words, encoder_out from current beam search nodes
             prev_words = torch.stack([node.sequence for node in nodes])
@@ -143,16 +155,17 @@ def main(args):
                 decoder_out, _ = model.decoder(prev_words, encoder_out)
 
             # see __QUESTION 2
-            log_probs, next_candidates = torch.topk(torch.log(torch.softmax(decoder_out, dim=2)), args.beam_size+1, dim=-1)
+            log_probs, next_candidates = torch.topk(torch.log(torch.softmax(decoder_out, dim=2)), args.beam_size + 1,
+                                                    dim=-1)
 
-            # Create number of beam_size next nodes for every current node
+            #  Create number of beam_size next nodes for every current node
             for i in range(log_probs.shape[0]):
                 for j in range(args.beam_size):
 
                     best_candidate = next_candidates[i, :, j]
-                    backoff_candidate = next_candidates[i, :, j+1]
+                    backoff_candidate = next_candidates[i, :, j + 1]
                     best_log_p = log_probs[i, :, j]
-                    backoff_log_p = log_probs[i, :, j+1]
+                    backoff_log_p = log_probs[i, :, j + 1]
                     next_word = torch.where(best_candidate == tgt_dict.unk_idx, backoff_candidate, best_candidate)
                     log_p = torch.where(best_candidate == tgt_dict.unk_idx, backoff_log_p, best_log_p)
                     log_p = log_p[-1]
@@ -165,26 +178,45 @@ def main(args):
                     # __QUESTION 4: How are "add" and "add_final" different? What would happen if we did not make this distinction?
 
                     # Store the node as final if EOS is generated
-                    if next_word[-1 ] == tgt_dict.eos_idx:
+                    if next_word[-1] == tgt_dict.eos_idx:
                         node = BeamSearchNode(search, node.emb, node.lstm_out, node.final_hidden,
                                               node.final_cell, node.mask, torch.cat((prev_words[i][0].view([1]),
-                                              next_word)), node.logp, node.length)
-                        search.add_final(-node.eval(), node)
+                                                                                     next_word)), node.logp,
+                                              node.length)
+                        # Add length normalization
+                        score = node.logp / Length_normalization(node.length)
+                        # add diverse
+                        score = diversity(score, j)
+                        search.add_final(-score, node)
 
                     # Add the node to current nodes for next iteration
                     else:
                         node = BeamSearchNode(search, node.emb, node.lstm_out, node.final_hidden,
                                               node.final_cell, node.mask, torch.cat((prev_words[i][0].view([1]),
-                                              next_word)), node.logp + log_p, node.length + 1)
-                        search.add(-node.eval(), node)
+                                                                                     next_word)), node.logp + log_p,
+                                              node.length + 1)
+                        # Add length normalization
+                        score = node.logp / Length_normalization(node.length)
+                        # add diverse
+                        score = diversity(score, j)
+                        search.add(-score, node)
 
             # __QUESTION 5: What happens internally when we prune our beams?
             # How do we know we always maintain the best sequences?
             for search in searches:
                 search.prune()
 
-        # Segment into sentences
-        best_sents = torch.stack([search.get_best()[1].sequence[1:].cpu() for search in searches])
+        # Segment into 1 best sentences
+        #best_sents = torch.stack([search.get_best()[1].sequence[1:].cpu() for search in searches])
+
+        # segment 3 best output
+        best_sents = torch.stack([n[1].sequence[1:] for s in searches for n in s.get_best()])
+
+        # segment into n best sentences
+
+        print('n best sents', best_sents)
+
+        # concatenates a sequence of tensors, gets the one best here, so we should use the n-best (3 best) here
         decoded_batch = best_sents.numpy()
 
         output_sentences = [decoded_batch[row, :] for row in range(decoded_batch.shape[0])]
@@ -192,8 +224,8 @@ def main(args):
         # __QUESTION 6: What is the purpose of this for loop?
         temp = list()
         for sent in output_sentences:
-            first_eos = np.where(sent == tgt_dict.eos_idx)[0]
-            if len(first_eos) > 0:
+            first_eos = np.where(sent == tgt_dict.eos_idx)[0]  # predicts first eos token
+            if len(first_eos) > 0:  # checks if the first eos token is not the beginning (position 0)
                 temp.append(sent[:first_eos[0]])
             else:
                 temp.append(sent)
@@ -202,15 +234,29 @@ def main(args):
         # Convert arrays of indices into strings of words
         output_sentences = [tgt_dict.string(sent) for sent in output_sentences]
 
+       
         for ii, sent in enumerate(output_sentences):
-            all_hyps[int(sample['id'].data[ii])] = sent
+            # all_hyps[int(sample['id'].data[ii])] = sent
+            
+            all_hyps[(int(sample['id'].data[int(ii / 3)]), int(ii % 3))] = sent
 
-
-    # Write to file
+    # Write to file (write 3 best per sentence together)
     if args.output is not None:
         with open(args.output, 'w') as out_file:
             for sent_id in range(len(all_hyps.keys())):
-                out_file.write(all_hyps[sent_id] + '\n')
+                # out_file.write(all_hyps[sent_id] + '\n')
+                
+                out_file.write(all_hyps[(int(sent_id / 3), int(sent_id % 3))] + '\n')
+
+
+def Length_normalization(length):
+    return ((5 + length) / 6/0) ** args.alpha
+
+
+
+def diversity(score, j):
+    # implements diversity search from paper
+    return score -args.gamma * j
 
 
 if __name__ == '__main__':
